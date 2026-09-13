@@ -28,11 +28,7 @@ namespace Vortos\Backup\Health;
  */
 final readonly class WalEfficiency
 {
-    /**
-     * PostgreSQL's DEFAULT `wal_segment_size`, used only when the cluster's real size is not known. The
-     * size is fixed per cluster at initdb, so on a cluster built otherwise this is the wrong denominator —
-     * see $segmentBytes (FB-65).
-     */
+    /** A Postgres WAL segment at the default `wal_segment_size`. The denominator the padding is measured against. */
     public const SEGMENT_BYTES = 16 * 1024 * 1024;
 
     public function __construct(
@@ -40,8 +36,6 @@ final readonly class WalEfficiency
         public int $segments,
         public int $totalStoredBytes,
         public int $windowHours,
-        /** The cluster's real `wal_segment_size`: what one uncompressed segment weighs at rest. */
-        public int $segmentBytes = self::SEGMENT_BYTES,
     ) {}
 
     public function meanStoredBytes(): float
@@ -50,7 +44,7 @@ final readonly class WalEfficiency
     }
 
     /**
-     * How much smaller a stored segment is than the whole segment it represents.
+     * How much smaller a stored segment is than the 16 MiB it represents.
      *
      * 1.0 means segments are shipped at full size — the pre-compression state. Reported rather than
      * asserted here; the threshold belongs to the probe, which is where an operator can see it.
@@ -59,7 +53,7 @@ final readonly class WalEfficiency
     {
         $mean = $this->meanStoredBytes();
 
-        return $mean <= 0.0 ? 0.0 : $this->segmentBytes / $mean;
+        return $mean <= 0.0 ? 0.0 : self::SEGMENT_BYTES / $mean;
     }
 
     /** Extrapolated so the number reads the way a bill does, independent of the window chosen. */

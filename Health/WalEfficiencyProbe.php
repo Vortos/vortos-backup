@@ -9,7 +9,6 @@ use Psr\Clock\ClockInterface;
 use Throwable;
 use Vortos\Backup\Catalog\WalVolumeReadModelInterface;
 use Vortos\Backup\Domain\DatabaseEngine;
-use Vortos\Backup\Pitr\XlogLongPageHeader;
 use Vortos\Health\Probe\HealthProbeInterface;
 use Vortos\Health\Probe\ProbeKind;
 use Vortos\Health\Probe\ProbeResult;
@@ -52,13 +51,6 @@ final class WalEfficiencyProbe implements HealthProbeInterface
         /** The daily at-rest budget for WAL. Crossing it is a real change in write volume, not a codec regression. */
         private readonly int $maxDailyBytes = 5 * 1024 * 1024 * 1024,
         private readonly int $windowHours = 24,
-        /**
-         * The cluster's real segment size. The ratio is only meaningful against it: at 2 MiB, dividing by
-         * an assumed 16 MiB reports an UNCOMPRESSED archive as 8x compressed, which is how this probe went
-         * blind to the exact regression it exists to catch (FB-65). Null keeps the 16 MiB default for
-         * hosts that cannot say, and the result records that it was assumed.
-         */
-        private readonly ?WalFileSizeResolverInterface $segmentSize = null,
     ) {}
 
     public function name(): string
@@ -94,19 +86,12 @@ final class WalEfficiencyProbe implements HealthProbeInterface
             );
         }
 
-        [$segmentBytes, $segmentSource, $segmentError] = $this->resolveSegmentBytes();
-
         $efficiency = new WalEfficiency(
             $this->environment,
             $volume['segments'],
             $volume['bytes'],
             $this->windowHours,
-            $segmentBytes ?? WalEfficiency::SEGMENT_BYTES,
         );
-
-        // A ratio against a guessed denominator is not a verdict. When a resolver is wired but cannot
-        // answer, compression is left unjudged rather than judged wrongly; volume is still checked.
-        $ratioJudgeable = $segmentBytes !== null;
 
         $context = [
             'environment'        => $this->environment,
@@ -114,10 +99,8 @@ final class WalEfficiencyProbe implements HealthProbeInterface
             'segments'           => $efficiency->segments,
             'stored_bytes'       => $efficiency->totalStoredBytes,
             'mean_segment_bytes' => (int) round($efficiency->meanStoredBytes()),
-            'compression_ratio'  => $ratioJudgeable ? round($efficiency->compressionRatio(), 1) : null,
+            'compression_ratio'  => round($efficiency->compressionRatio(), 1),
             'projected_daily_gb' => round($efficiency->projectedDailyBytes() / (1024 ** 3), 2),
-            'segment_bytes'        => $efficiency->segmentBytes,
-            'segment_bytes_source' => $segmentSource,
         ];
 
         // Too few segments to judge. Not a pass — a quiet window proves nothing — but emphatically
@@ -132,7 +115,7 @@ final class WalEfficiencyProbe implements HealthProbeInterface
             );
         }
 
-        if ($ratioJudgeable && $efficiency->compressionRatio() < $this->minCompressionRatio) {
+        if ($efficiency->compressionRatio() < $this->minCompressionRatio) {
             return ProbeResult::fail(
                 $this->name(),
                 $this->kind(),
@@ -140,7 +123,7 @@ final class WalEfficiencyProbe implements HealthProbeInterface
                 'wal_compression_ineffective',
                 $context + [
                     'expected_min_ratio' => $this->minCompressionRatio,
-                    'hint'               => sprintf('WAL segments are reaching the store at close to their full %d KiB. ', intdiv($efficiency->segmentBytes, 1024))
+                    'hint'               => 'WAL segments are reaching the store at close to their full 16 MiB. '
                         . 'Check the configured codec (config/backup.php walCompression, or VORTOS_BACKUP_WAL_CODEC).',
                 ],
             );
@@ -160,39 +143,7 @@ final class WalEfficiencyProbe implements HealthProbeInterface
             );
         }
 
-        if (!$ratioJudgeable) {
-            return ProbeResult::warn(
-                $this->name(),
-                $this->kind(),
-                $this->elapsedMs($start),
-                'wal_efficiency_indeterminate',
-                $context + ['reason' => 'cannot read the cluster wal_segment_size', 'error' => $segmentError],
-            );
-        }
-
         return ProbeResult::pass($this->name(), $this->kind(), $this->elapsedMs($start), $context);
-    }
-
-    /**
-     * @return array{?int, string, ?string} bytes (null when a resolver is wired but cannot answer), source, error
-     */
-    private function resolveSegmentBytes(): array
-    {
-        if ($this->segmentSize === null) {
-            return [WalEfficiency::SEGMENT_BYTES, 'assumed_default', null];
-        }
-
-        try {
-            $bytes = $this->segmentSize->segmentBytes();
-        } catch (Throwable $e) {
-            return [null, 'unreadable', $e->getMessage()];
-        }
-
-        if (!XlogLongPageHeader::isPlausibleSegmentBytes($bytes)) {
-            return [null, 'unreadable', sprintf('implausible wal_segment_size %d', $bytes)];
-        }
-
-        return [$bytes, 'server', null];
     }
 
     private function elapsedMs(float $start): float
